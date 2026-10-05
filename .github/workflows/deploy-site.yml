@@ -63,14 +63,14 @@ jobs:
           case "$D1_DATABASE_ID" in ''|*[!0-9a-fA-F-]*) echo "D1_DATABASE_ID secret is missing or malformed"; exit 1;; esac
           sed -i "s/REPLACE_D1_DATABASE_ID/${D1_DATABASE_ID}/" site/wrangler.toml
       - name: Deploy to Cloudflare Pages
-        working-directory: core
+        working-directory: core/site
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_PAGES_PROJECT: ${{ vars.CF_PAGES_PROJECT || 'pin-factory-site' }}
         run: |
           # VERIFY: --branch must match the Pages production branch (default "main") so this becomes the production deployment.
-          npx wrangler pages deploy site/out --project-name "$CF_PAGES_PROJECT" --branch main --commit-dirty=true
+          npx wrangler pages deploy out --project-name "$CF_PAGES_PROJECT" --branch main --commit-dirty=true
       - name: Upload job output
         if: always()
         uses: actions/upload-artifact@v4
