@@ -1,0 +1,52 @@
+# Weekly "alive" ping to Telegram.
+# NOTE: GitHub pauses scheduled workflows in a PUBLIC repo after 60 days without repo activity.
+# If the schedules stop: open this repo -> Actions -> pick a workflow -> tap "Enable workflow",
+# or push any small commit (for example edit README.md). No no-op commit is made automatically.
+name: heartbeat
+on:
+  schedule:
+    - cron: '30 2 * * 1'   # Monday 02:30 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: Heartbeat
+        working-directory: core
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          node src/jobs/heartbeat.js
+      - name: Upload job output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heartbeat-output
+          path: core/out/**
+          retention-days: 7
+          if-no-files-found: ignore
