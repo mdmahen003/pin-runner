@@ -1,0 +1,45 @@
+# Deploy the dedicated image Worker (pin-image-api) and set its bearer secret.
+name: deploy-image-worker
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-image-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: Deploy image Worker
+        working-directory: core
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          npx wrangler deploy --config workers/image-api/wrangler.toml
+      - name: Set Worker secret IMAGE_WORKER_SECRET
+        working-directory: core
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          IMAGE_WORKER_SECRET: ${{ secrets.IMAGE_WORKER_SECRET }}
+        run: |
+          if [ -z "$IMAGE_WORKER_SECRET" ]; then echo "IMAGE_WORKER_SECRET is empty"; exit 1; fi
+          printf '%s' "$IMAGE_WORKER_SECRET" | npx wrangler secret put IMAGE_WORKER_SECRET --config workers/image-api/wrangler.toml
