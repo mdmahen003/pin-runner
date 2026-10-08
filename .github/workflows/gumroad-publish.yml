@@ -138,9 +138,12 @@ jobs:
             ARGS+=(--cover-image "$COVER")
             # Gumroad needs a SQUARE thumbnail: fit the cover into a 600x600 white square
             THUMB=/tmp/thumb.png
-            CONV=""
-            if command -v magick >/dev/null 2>&1; then CONV="magick"; elif command -v convert >/dev/null 2>&1; then CONV="convert"; fi
-            if [ -n "$CONV" ] && $CONV "$COVER" -resize 600x600 -background white -gravity center -extent 600x600 "$THUMB" && [ -s "$THUMB" ]; then
+            if COVER_IN="$COVER" THUMB_OUT="$THUMB" node --input-type=module -e "
+                import sharp from 'sharp';
+                await sharp(process.env.COVER_IN)
+                  .resize(600, 600, { fit: 'contain', background: '#ffffff' })
+                  .png().toFile(process.env.THUMB_OUT);
+              " && [ -s "$THUMB" ]; then
               ARGS+=(--thumbnail "$THUMB")
             else
               echo "NOTE: could not make a square thumbnail, add one by hand in Gumroad."
