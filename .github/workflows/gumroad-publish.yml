@@ -1,0 +1,179 @@
+# Build a product's PDFs and create it on Gumroad (draft by default) using the official Gumroad CLI.
+# Needs the repository secret GUMROAD_ACCESS_TOKEN (Gumroad > Settings > Advanced > Applications).
+# Put this file in pin-runner/.github/workflows/gumroad-publish.yml
+name: gumroad-publish
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: 'Product id, e.g. budget-planner-v1'
+        type: string
+        required: true
+        default: 'budget-planner-v1'
+      publish_on_gumroad:
+        description: 'Publish the product on Gumroad (leave off to keep it a draft)'
+        type: boolean
+        default: false
+      write_back:
+        description: 'Save checkout_url/checkout_ref into products.json in pin-core'
+        type: boolean
+        default: true
+      force:
+        description: 'Create even if products.json already has a checkout link (makes a duplicate)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+
+concurrency:
+  group: gumroad-publish
+  cancel-in-progress: false
+
+jobs:
+  gumroad:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check inputs and token
+        env:
+          PRODUCT: ${{ inputs.product }}
+          GUMROAD_ACCESS_TOKEN: ${{ secrets.GUMROAD_ACCESS_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        working-directory: core
+        run: |
+          case "$PRODUCT" in *[!a-z0-9-]*|'') echo "invalid product id"; exit 1;; esac
+          if [ -z "$GUMROAD_ACCESS_TOKEN" ]; then echo "GUMROAD_ACCESS_TOKEN secret is missing"; exit 1; fi
+          jq -e --arg id "$PRODUCT" '.products[] | select(.id==$id)' config/products.json > /dev/null \
+            || { echo "product $PRODUCT not found in config/products.json"; exit 1; }
+          REF=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .checkout_ref' config/products.json)
+          case "$REF" in
+            *REPLACE*|'') echo "checkout_ref is still a placeholder: OK to create";;
+            *) if [ "$FORCE" != "true" ]; then echo "products.json already has checkout_ref=$REF. Use force to create a duplicate."; exit 1; fi;;
+          esac
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: Install Chromium and exiftool
+        working-directory: core
+        run: |
+          npx playwright install --with-deps chromium
+          sudo apt-get install -y libimage-exiftool-perl
+      - name: Build product PDFs
+        working-directory: core
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          PRODUCT: ${{ inputs.product }}
+        run: node src/jobs/weekly-products.js --product "$PRODUCT"
+      - name: Install Gumroad CLI
+        run: |
+          curl -fsSL https://gumroad.com/install-cli.sh | bash || true
+          export PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"
+          if ! command -v gumroad >/dev/null 2>&1; then
+            go install github.com/antiwork/gumroad-cli/cmd/gumroad@latest
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          gumroad --version || true
+      - name: Create the Gumroad product
+        id: create
+        working-directory: core
+        env:
+          GUMROAD_ACCESS_TOKEN: ${{ secrets.GUMROAD_ACCESS_TOKEN }}
+          PRODUCT: ${{ inputs.product }}
+        run: |
+          set -euo pipefail
+          VER=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .version' config/products.json)
+          NAME=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .name' config/products.json)
+          PRICE=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .price_usd' config/products.json)
+          DIR="out/products/$PRODUCT/v$VER"
+          ls -la "$DIR"
+          for f in ipad.pdf a4.pdf letter.pdf delivery.pdf; do test -s "$DIR/$f" || { echo "missing $DIR/$f"; exit 1; }; done
+
+          DESC=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .site |
+            "<p><strong>" + .headline + "</strong></p><p>" + .subheadline + "</p><ul>" +
+            ([.whats_inside[] | "<li>" + . + "</li>"] | join("")) + "</ul><p>" + .guarantee + "</p>"' config/products.json)
+
+          echo "---- gumroad products create --help ----"
+          gumroad products create --help || true
+          echo "-----------------------------------------"
+
+          ARGS=(products create --name "$NAME" --price "$PRICE" --json)
+          if gumroad products create --help 2>&1 | grep -q -- '--description'; then
+            ARGS+=(--description "$DESC")
+          else
+            echo "NOTE: this CLI version has no --description flag. Add the description in Gumroad by hand."
+          fi
+          ARGS+=(--file "$DIR/ipad.pdf"     --file-name "$NAME - Tablet (landscape).pdf")
+          ARGS+=(--file "$DIR/a4.pdf"       --file-name "$NAME - A4 print.pdf")
+          ARGS+=(--file "$DIR/letter.pdf"   --file-name "$NAME - US Letter print.pdf")
+          ARGS+=(--file "$DIR/delivery.pdf" --file-name "Start here - delivery guide.pdf")
+
+          gumroad "${ARGS[@]}" | tee /tmp/created.json
+          jq . /tmp/created.json > /dev/null
+
+          ID=$(jq -r '(.product.id // .id // empty)' /tmp/created.json)
+          URL=$(jq -r '(.product.short_url // .short_url // .product.url // .url // empty)' /tmp/created.json)
+          if [ -z "$ID" ] || [ -z "$URL" ]; then
+            echo "Could not read id/url from the Gumroad response (see JSON above)."; exit 1
+          fi
+          REF=$(basename "$URL")
+          echo "id=$ID"   >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Gumroad product created (draft)"
+            echo ""
+            echo "- id: \`$ID\`"
+            echo "- link: $URL"
+            echo "- checkout_ref: \`$REF\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish on Gumroad
+        if: ${{ inputs.publish_on_gumroad }}
+        env:
+          GUMROAD_ACCESS_TOKEN: ${{ secrets.GUMROAD_ACCESS_TOKEN }}
+          PID: ${{ steps.create.outputs.id }}
+        run: gumroad products publish "$PID"
+      - name: Save the link into products.json (pin-core)
+        if: ${{ inputs.write_back }}
+        continue-on-error: true
+        working-directory: core
+        env:
+          PRODUCT: ${{ inputs.product }}
+          URL: ${{ steps.create.outputs.url }}
+          REF: ${{ steps.create.outputs.ref }}
+        run: |
+          set -euo pipefail
+          jq --arg id "$PRODUCT" --arg url "$URL" --arg ref "$REF" \
+            '(.products[] | select(.id==$id)) |= (.checkout_url=$url | .checkout_ref=$ref)' \
+            config/products.json > /tmp/products.json
+          mv /tmp/products.json config/products.json
+          git config user.name "pin-factory-bot"
+          git config user.email "pin-factory-bot@users.noreply.github.com"
+          git add config/products.json
+          git commit -m "chore: set Gumroad checkout link for $PRODUCT"
+          git push
+      - name: Show what to paste if the save step failed
+        if: always() && steps.create.outputs.url != ''
+        run: |
+          echo "checkout_url: ${{ steps.create.outputs.url }}"
+          echo "checkout_ref: ${{ steps.create.outputs.ref }}"
