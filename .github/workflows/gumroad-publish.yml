@@ -134,7 +134,20 @@ jobs:
           while IFS= read -r T; do [ -n "$T" ] && ARGS+=(--tag "$T"); done < <(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .hero_keywords[]' config/products.json)
           # cover + extra preview images from the built preview pages (only files that exist)
           COVER="$DIR/preview/page-01.png"
-          if [ -s "$COVER" ]; then ARGS+=(--cover-image "$COVER" --thumbnail "$COVER"); else echo "NOTE: $COVER not found, add a cover by hand."; fi
+          if [ -s "$COVER" ]; then
+            ARGS+=(--cover-image "$COVER")
+            # Gumroad needs a SQUARE thumbnail: fit the cover into a 600x600 white square
+            THUMB=/tmp/thumb.png
+            CONV=""
+            if command -v magick >/dev/null 2>&1; then CONV="magick"; elif command -v convert >/dev/null 2>&1; then CONV="convert"; fi
+            if [ -n "$CONV" ] && $CONV "$COVER" -resize 600x600 -background white -gravity center -extent 600x600 "$THUMB" && [ -s "$THUMB" ]; then
+              ARGS+=(--thumbnail "$THUMB")
+            else
+              echo "NOTE: could not make a square thumbnail, add one by hand in Gumroad."
+            fi
+          else
+            echo "NOTE: $COVER not found, add a cover by hand."
+          fi
           for N in $(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .preview_pages[]' config/products.json | head -5); do
             F=$(printf "%s/preview/page-%02d.png" "$DIR" "$N")
             if [ "$F" != "$COVER" ] && [ -s "$F" ]; then ARGS+=(--preview-image "$F"); fi
