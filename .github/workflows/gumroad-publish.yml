@@ -84,6 +84,15 @@ jobs:
           SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
           PRODUCT: ${{ inputs.product }}
         run: node src/jobs/weekly-products.js --product "$PRODUCT"
+      - name: Keep the built PDFs for 3 days so you can check them
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-pdfs
+          path: |
+            core/out/products/${{ inputs.product }}/**/delivery.pdf
+            core/out/products/${{ inputs.product }}/**/ipad.pdf
+            core/out/products/${{ inputs.product }}/**/free-mini.pdf
+          retention-days: 3
       - name: Install Gumroad CLI
         run: |
           curl -fsSL https://gumroad.com/install-cli.sh | bash || true
@@ -117,12 +126,19 @@ jobs:
           gumroad products create --help || true
           echo "-----------------------------------------"
 
-          ARGS=(products create --name "$NAME" --price "$PRICE" --json)
-          if gumroad products create --help 2>&1 | grep -q -- '--description'; then
-            ARGS+=(--description "$DESC")
-          else
-            echo "NOTE: this CLI version has no --description flag. Add the description in Gumroad by hand."
-          fi
+          SUMMARY=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .site.subheadline' config/products.json)
+          # Always create as a DRAFT. The "Publish on Gumroad" step makes it live only if you ticked that box.
+          ARGS=(products create --name "$NAME" --price "$PRICE" --draft --refund-period 14 --custom-summary "$SUMMARY" --json --yes --non-interactive)
+          ARGS+=(--description "$DESC")
+          # tags from hero_keywords
+          while IFS= read -r T; do [ -n "$T" ] && ARGS+=(--tag "$T"); done < <(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .hero_keywords[]' config/products.json)
+          # cover + extra preview images from the built preview pages (only files that exist)
+          COVER="$DIR/preview/page-01.png"
+          if [ -s "$COVER" ]; then ARGS+=(--cover-image "$COVER" --thumbnail "$COVER"); else echo "NOTE: $COVER not found, add a cover by hand."; fi
+          for N in $(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .preview_pages[]' config/products.json | head -5); do
+            F=$(printf "%s/preview/page-%02d.png" "$DIR" "$N")
+            if [ "$F" != "$COVER" ] && [ -s "$F" ]; then ARGS+=(--preview-image "$F"); fi
+          done
           ARGS+=(--file "$DIR/ipad.pdf"     --file-name "$NAME - Tablet (landscape).pdf")
           ARGS+=(--file "$DIR/a4.pdf"       --file-name "$NAME - A4 print.pdf")
           ARGS+=(--file "$DIR/letter.pdf"   --file-name "$NAME - US Letter print.pdf")
@@ -141,7 +157,7 @@ jobs:
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           {
-            echo "### Gumroad product created (draft)"
+            echo "### Gumroad product created (draft unless you ticked Publish)"
             echo ""
             echo "- id: \`$ID\`"
             echo "- link: $URL"
