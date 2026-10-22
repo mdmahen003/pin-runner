@@ -1,0 +1,90 @@
+# Make a drafted product live: marks it active, uploads PDFs/previews to R2+D1, then deploys the site.
+# Put this file in pin-runner/.github/workflows/go-live.yml
+# Run it AFTER add-product / gumroad-publish created the Gumroad draft and you have published it on Gumroad.
+name: go-live
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: 'Product id, e.g. holiday-planner-v1'
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: go-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the product id
+        env:
+          PRODUCT: ${{ inputs.product }}
+        working-directory: core
+        run: |
+          case "$PRODUCT" in *[!a-z0-9-]*|'') echo "invalid product id"; exit 1;; esac
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: Mark the product active
+        working-directory: core
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          PRODUCT: ${{ inputs.product }}
+        run: node src/jobs/pack-apply.js --activate "$PRODUCT"
+      - name: Save the status into pin-core
+        working-directory: core
+        env:
+          PRODUCT: ${{ inputs.product }}
+        run: |
+          git config user.name "pin-factory-bot"
+          git config user.email "pin-factory-bot@users.noreply.github.com"
+          git add config/products.json
+          if git diff --cached --quiet; then
+            echo "already active"
+          else
+            git commit -m "feat: $PRODUCT is live"
+            git push
+          fi
+      - name: Upload PDFs and previews (weekly-products with publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ inputs.product }}
+        run: |
+          gh workflow run weekly-products.yml -f product="$PRODUCT" -f publish=true
+          sleep 20
+          RUN=$(gh run list --workflow=weekly-products.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+          echo "watching weekly-products run $RUN"
+          gh run watch "$RUN" --exit-status
+      - name: Deploy the site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run deploy-site.yml
+          echo "### Live" >> "$GITHUB_STEP_SUMMARY"
+          echo "Product marked active, files uploaded, site deploy started. New pins for it start with the next daily-factory run." >> "$GITHUB_STEP_SUMMARY"

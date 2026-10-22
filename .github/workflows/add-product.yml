@@ -1,0 +1,107 @@
+# Turn a product pack (packs/<id>.json in pin-core) into a real draft product.
+# Put this file in pin-runner/.github/workflows/add-product.yml
+#
+# 1) check_only = true  -> only checks the pack file and tells you what is wrong (changes nothing)
+# 2) check_only = false -> writes product/board/keywords into pin-core, sends the "create this Pinterest board" card to
+#                          Telegram and (if start_gumroad is on) starts gumroad-publish, which builds the PDFs and
+#                          creates the Gumroad draft.
+name: add-product
+on:
+  workflow_dispatch:
+    inputs:
+      pack:
+        description: 'Pack id = file name in pin-core/packs without .json, e.g. holiday-planner-v1'
+        type: string
+        required: true
+      check_only:
+        description: 'Only check the pack file (change nothing)'
+        type: boolean
+        default: true
+      start_gumroad:
+        description: 'After applying, start gumroad-publish (builds PDFs + Gumroad draft)'
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: add-product
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the pack id
+        env:
+          PACK: ${{ inputs.pack }}
+        working-directory: core
+        run: |
+          case "$PACK" in *[!a-z0-9-]*|'') echo "invalid pack id"; exit 1;; esac
+          test -s "packs/$PACK.json" || { echo "packs/$PACK.json not found in pin-core"; exit 1; }
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: Check / apply the pack
+        working-directory: core
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          PACK: ${{ inputs.pack }}
+          CHECK_ONLY: ${{ inputs.check_only }}
+        run: |
+          if [ "$CHECK_ONLY" = "true" ]; then
+            node src/jobs/pack-apply.js --pack "$PACK" --check
+          else
+            node src/jobs/pack-apply.js --pack "$PACK"
+          fi
+      - name: Save the changes into pin-core
+        if: ${{ !inputs.check_only }}
+        working-directory: core
+        env:
+          PACK: ${{ inputs.pack }}
+        run: |
+          git config user.name "pin-factory-bot"
+          git config user.email "pin-factory-bot@users.noreply.github.com"
+          git add config src/pdf/pages.json
+          if git diff --cached --quiet; then
+            echo "nothing changed (pack was already applied)"
+          else
+            git commit -m "feat: add product pack $PACK"
+            git push
+          fi
+      - name: Deploy the site (so the new board feed link works)
+        if: ${{ !inputs.check_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy-site.yml
+      - name: Start gumroad-publish (PDFs + Gumroad draft)
+        if: ${{ !inputs.check_only && inputs.start_gumroad }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACK: ${{ inputs.pack }}
+        run: |
+          gh workflow run gumroad-publish.yml -f product="$PACK" -f publish_on_gumroad=false -f write_back=true
+          echo "### Next" >> "$GITHUB_STEP_SUMMARY"
+          echo "gumroad-publish was started for \`$PACK\`. Create the Pinterest board from the Telegram card, check the Gumroad draft, then run **go-live**." >> "$GITHUB_STEP_SUMMARY"
