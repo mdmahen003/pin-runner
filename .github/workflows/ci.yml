@@ -44,6 +44,15 @@ jobs:
           else
             echo "site/ not present - skipped"
           fi
+      - name: Dashboard tests
+        working-directory: core
+        run: |
+          if [ -f dashboard/package.json ]; then
+            cd dashboard
+            node --test tests/*.test.js
+          else
+            echo "dashboard/ not present - skipped"
+          fi
       - name: Upload job output
         if: always()
         uses: actions/upload-artifact@v4
