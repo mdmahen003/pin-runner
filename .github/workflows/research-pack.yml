@@ -1,0 +1,99 @@
+# Research -> product, part 1 (automatic until the Pinterest/Gumroad hand steps).
+# Every 3 hours:
+#   1) build    approved research proposals -> packs/<id>.json (checked with the same validator as add-product)
+#   2) save     commit + push the new pack files into pin-core
+#   3) notify   Telegram card "start?" with buttons for each pack that is really in pin-core
+#   4) start    for packs you pressed OK on: run add-product (check_only=false, start_gumroad=true)
+# You still do by hand: create the Pinterest board, press Publish on the Gumroad draft, run go-live.
+name: research-pack
+on:
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max packs to build in this run'
+        type: string
+        default: '2'
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: research-pack
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+      OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+      LLM_PROVIDER_ORDER: ${{ vars.LLM_PROVIDER_ORDER }}
+      LLM_MIN_GAP_MS: ${{ vars.LLM_MIN_GAP_MS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pin-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CORE_REPO }}
+          token: ${{ secrets.CORE_PAT }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: core
+        run: npm install --no-audit --no-fund
+      - name: 1) Build packs from approved proposals
+        working-directory: core
+        env:
+          LIMIT: ${{ inputs.limit || '2' }}
+        run: node src/jobs/research-pack.js --phase build --limit "$LIMIT"
+      - name: 2) Save packs into pin-core
+        working-directory: core
+        env:
+          CORE_REPO: ${{ vars.CORE_REPO }}
+          PUSH_FALLBACK_TOKENS: ${{ secrets.WORKFLOW_PAT }}
+        run: bash tools/push-pack.sh
+      - name: 3) Telegram "start?" cards
+        working-directory: core
+        run: node src/jobs/research-pack.js --phase notify
+      - name: 4) Start add-product for packs you approved
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd core && node src/jobs/research-pack.js --phase start-list)
+          touch core/out/start-ids.txt
+          while read -r pid pack; do
+            [ -n "$pid" ] || continue
+            case "$pack" in *[!a-z0-9-]*|'') echo "bad pack id, skipped"; continue;; esac
+            if gh workflow run add-product.yml -f pack="$pack" -f check_only=false -f start_gumroad=true; then
+              (cd core && node src/jobs/research-pack.js --phase mark-started --id "$pid")
+            else
+              (cd core && node src/jobs/research-pack.js --phase mark-start-failed --id "$pid")
+            fi
+          done < core/out/start-ids.txt
+      - name: Upload job output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-pack-output
+          path: core/out/**
+          retention-days: 7
+          if-no-files-found: ignore

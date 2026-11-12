@@ -22,6 +22,15 @@ on:
         description: 'Create even if products.json already has a checkout link (makes a duplicate)'
         type: boolean
         default: false
+      use_permalink:
+        description: 'Send a keyword custom permalink (untick if Gumroad says the permalink is taken)'
+        type: boolean
+        default: true
+      category:
+        description: 'Gumroad category path (empty = pick automatically from the live list; copy a PATH from "gumroad products categories")'
+        type: string
+        required: false
+        default: ''
 permissions:
   contents: read
 
@@ -109,29 +118,44 @@ jobs:
         env:
           GUMROAD_ACCESS_TOKEN: ${{ secrets.GUMROAD_ACCESS_TOKEN }}
           PRODUCT: ${{ inputs.product }}
+          USE_PERMALINK: ${{ inputs.use_permalink }}
+          CATEGORY_INPUT: ${{ inputs.category }}
         run: |
           set -euo pipefail
           VER=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .version' config/products.json)
-          NAME=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .name' config/products.json)
-          PRICE=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .price_usd' config/products.json)
+          # Listing metadata (name, price, summary, SEO description, tags, permalink) comes from tools/gumroad-meta.mjs
+          # (src/pack/gumroad-meta.js). It refuses an invalid product and drops tags that break the copy rules.
+          node tools/gumroad-meta.mjs meta "$PRODUCT" > /tmp/meta.json
+          NAME=$(jq -r '.name' /tmp/meta.json)
+          PRICE=$(jq -r '.price' /tmp/meta.json)
+          SUMMARY=$(jq -r '.summary' /tmp/meta.json)
+          DESC=$(jq -r '.description_html' /tmp/meta.json)
+          PERMALINK=$(jq -r '.custom_permalink' /tmp/meta.json)
           DIR="out/products/$PRODUCT/v$VER"
           ls -la "$DIR"
           for f in ipad.pdf a4.pdf letter.pdf delivery.pdf; do test -s "$DIR/$f" || { echo "missing $DIR/$f"; exit 1; }; done
 
-          DESC=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .site |
-            "<p><strong>" + .headline + "</strong></p><p>" + .subheadline + "</p><ul>" +
-            ([.whats_inside[] | "<li>" + . + "</li>"] | join("")) + "</ul><p>" + .guarantee + "</p>"' config/products.json)
 
           echo "---- gumroad products create --help ----"
           gumroad products create --help || true
           echo "-----------------------------------------"
 
-          SUMMARY=$(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .site.subheadline' config/products.json)
+          # Category: the input wins; else product.gumroad.category; else the best match from Gumroad's live category list.
+          CATEGORY="${CATEGORY_INPUT:-}"
+          if [ -z "$CATEGORY" ]; then
+            if gumroad products categories --json --no-input > /tmp/cats.json 2>/tmp/cats.err; then
+              CATEGORY=$(node tools/gumroad-meta.mjs category "$PRODUCT" /tmp/cats.json | jq -r '.path // empty')
+            else
+              echo "NOTE: could not list Gumroad categories, set one by hand in Gumroad:"; cat /tmp/cats.err || true
+            fi
+          fi
           # Always create as a DRAFT. The "Publish on Gumroad" step makes it live only if you ticked that box.
           ARGS=(products create --name "$NAME" --price "$PRICE" --draft --refund-period 14 --custom-summary "$SUMMARY" --json --yes --non-interactive)
           ARGS+=(--description "$DESC")
-          # tags from hero_keywords
-          while IFS= read -r T; do [ -n "$T" ] && ARGS+=(--tag "$T"); done < <(jq -r --arg id "$PRODUCT" '.products[] | select(.id==$id) | .hero_keywords[]' config/products.json)
+          if [ "${USE_PERMALINK:-true}" = "true" ] && [ -n "$PERMALINK" ]; then ARGS+=(--custom-permalink "$PERMALINK"); fi
+          if [ -n "$CATEGORY" ]; then ARGS+=(--category "$CATEGORY"); fi
+          # tags (max 5, copy-rule safe) from the metadata
+          while IFS= read -r T; do [ -n "$T" ] && ARGS+=(--tag "$T"); done < <(jq -r '.tags[]' /tmp/meta.json)
           # cover + extra preview images from the built preview pages (only files that exist)
           COVER="$DIR/preview/page-01.png"
           if [ -s "$COVER" ]; then
@@ -160,7 +184,10 @@ jobs:
           ARGS+=(--file "$DIR/letter.pdf"   --file-name "$NAME - US Letter print.pdf")
           ARGS+=(--file "$DIR/delivery.pdf" --file-name "Start here - delivery guide.pdf")
 
-          gumroad "${ARGS[@]}" | tee /tmp/created.json
+          if ! gumroad "${ARGS[@]}" | tee /tmp/created.json; then
+            echo "Gumroad create failed. If the error mentions the permalink or the category, run again with use_permalink off, or give a category path by hand."
+            exit 1
+          fi
           jq . /tmp/created.json > /dev/null
 
           ID=$(jq -r '(.product.id // .id // empty)' /tmp/created.json)
@@ -178,6 +205,9 @@ jobs:
             echo "- id: \`$ID\`"
             echo "- link: $URL"
             echo "- checkout_ref: \`$REF\`"
+            echo "- permalink sent: \`$([ "${USE_PERMALINK:-true}" = "true" ] && echo "$PERMALINK" || echo "(none)")\`"
+            echo "- category sent: \`${CATEGORY:-(none: set one by hand, Discover needs it)}\`"
+            echo "- tags sent: $(jq -r '.tags | join(", ")' /tmp/meta.json)"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish on Gumroad
         if: ${{ inputs.publish_on_gumroad }}
